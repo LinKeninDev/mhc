@@ -1,5 +1,5 @@
 use maho_ext_api::*;
-use std::{io::{BufRead, Read, Write}, path::Path, sync::Arc, time::Duration};
+use std::{io::{BufRead, Write}, path::Path, sync::{Arc, mpsc}, time::Duration};
 
 struct Session;
 impl ToolSessionManager for Session {
@@ -38,7 +38,7 @@ impl ExtensionUi for Ui {
     fn theme(&self) -> Theme { Theme::default() }
 }
 fn context() -> ExtensionContext {
-    ExtensionContext { ui: Arc::new(Ui), mode: ExtensionMode::Print, has_ui: false, cwd: "/tmp".into(), agent_dir: "/tmp/agent".into(),
+    ExtensionContext { ui: Arc::new(Ui), mode: ExtensionMode::Tui, has_ui: false, cwd: "/tmp".into(), agent_dir: "/tmp/agent".into(),
         session_manager: Arc::new(Session), model_registry: Arc::new(Registry), model: None, thinking_level: None,
         service_tier: None, effective_service_tier: None, scoped_models: Vec::new(), goal_store_file: None,
         loaded_extension_paths: Vec::new(), signal: None, steering_signal: None,
@@ -49,43 +49,40 @@ fn context() -> ExtensionContext {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let port: u16 = std::env::var("ORCA_AGENT_HOOK_PORT")?.parse()?;
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let server = std::thread::spawn(move || -> std::io::Result<()> {
+    let socket = std::env::var("HERDR_SOCKET_PATH")?;
+    let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let (sender, receiver) = mpsc::channel();
+    let peer = std::thread::spawn(move || -> std::io::Result<()> {
         for _ in 0..4 {
             let (mut stream, _) = listener.accept()?;
             stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-            let mut reader = std::io::BufReader::new(stream.try_clone()?);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if !line.starts_with("POST /hook/pi ") { return Err(std::io::Error::other("unexpected HTTP route")); }
-            let mut length = 0;
-            loop {
-                line.clear(); reader.read_line(&mut line)?;
-                if line == "\r\n" { break; }
-                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") { length = value.trim().parse().map_err(std::io::Error::other)?; }
-            }
-            let mut body = vec![0; length]; reader.read_exact(&mut body)?;
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            let mut body = String::new();
+            std::io::BufReader::new(stream.try_clone()?).read_line(&mut body)?;
+            stream.write_all(b"ok\n")?;
             sender.send(body).map_err(std::io::Error::other)?;
         }
         Ok(())
     });
-    let mut runner = maho_ext_host::ExtensionRunner::from_static(vec![Box::new(maho_ext_orca_agent_status::OrcaAgentStatus)], context());
-    let events = [
-        ExtensionEvent::SessionStart(SessionStartEvent { reason: SessionReason::Startup, initial_model_provenance: None, previous_session_file: None }),
-        ExtensionEvent::BeforeAgentStart(BeforeAgentStartEvent { prompt: "faux prompt".into(), images: None, system_prompt: String::new(), system_prompt_options: Default::default() }),
-        ExtensionEvent::AgentStart,
-        if std::env::var("ORCA_QA_LEGACY_END").ok().as_deref() == Some("1") { ExtensionEvent::AgentEnd { messages: Vec::new(), aborted: None, will_retry: None, abort_source: None } } else { ExtensionEvent::AgentSettled },
-    ];
-    for event in events {
-        runner.emit(event).await?;
-        let body = tokio::time::timeout(Duration::from_secs(3),receiver.recv()).await?.ok_or("capture channel closed")?;
-        println!("{}", String::from_utf8(body)?);
+    let mut runner = maho_ext_host::ExtensionRunner::from_static(vec![Box::new(maho_ext_herdr_agent_state::HerdrAgentState)], context());
+    runner.emit(ExtensionEvent::SessionStart(SessionStartEvent { reason: SessionReason::Startup, initial_model_provenance: None, previous_session_file: None })).await?;
+    for method in ["pane.report_agent_session", "pane.report_agent"] {
+        let body: JsonValue = serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(3))?)?;
+        assert_eq!(body["method"], method);
+        assert_eq!(body["params"]["agent_session_id"], "faux-session");
+        println!("{body}");
     }
-    if !runner.errors.is_empty() { return Err("extension handler failed".into()); }
+    runner.events.emit("herdr:blocked", &serde_json::json!({"active":true,"label":"fixture"}));
+    let body: JsonValue = serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(3))?)?;
+    assert_eq!(body["params"]["state"], "blocked");
+    assert_eq!(body["params"]["message"], "fixture");
+    println!("{body}");
+    runner.events.emit("herdr:blocked", &serde_json::json!({"active":false}));
+    let body: JsonValue = serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(3))?)?;
+    assert_eq!(body["params"]["state"], "idle");
+    println!("{body}");
+    runner.emit(ExtensionEvent::SessionShutdown(SessionShutdownEvent { reason: SessionReason::Startup, target_session_file: None, signal: None })).await?;
     drop(runner);
-    server.join().map_err(|_| "capture server panicked")??;
+    peer.join().map_err(|_| "peer panicked")??;
+    std::fs::remove_file(socket)?;
     Ok(())
 }
